@@ -81,6 +81,7 @@
                                 <% if (ownAttendance.time_in_photo) { %>
                                     <img src="<%= ownAttendance.time_in_photo %>" onclick="openLightbox(this.src)" title="Time-In Photo (Click to zoom)" alt="Time-In Photo" style="width:34px;height:34px;border-radius:6px;object-fit:cover;border:2px solid #059669;cursor:pointer;">
                                 <% } %>
+                                
                             </div>
 
                             <% if (ownAttendance.time_out) { %>
@@ -90,6 +91,7 @@
                                     <% if (ownAttendance.time_out_photo) { %>
                                         <img src="<%= ownAttendance.time_out_photo %>" onclick="openLightbox(this.src)" title="Time-Out Photo (Click to zoom)" alt="Time-Out Photo" style="width:34px;height:34px;border-radius:6px;object-fit:cover;border:2px solid #2563eb;cursor:pointer;">
                                     <% } %>
+                                    
                                 </div>
                             <% } else { %>
                                 <span class="badge badge-warning" style="padding: 4px 10px; font-weight: 600;">Shift In Progress</span>

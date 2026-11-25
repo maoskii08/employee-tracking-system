@@ -1,5 +1,6 @@
 // Notification service
 const { getDb } = require('../db/database');
+const { getPendingCounts } = require('./pending-work');
 
 async function createNotification(userId, title, message, link = null, dedupKey = null) {
     const db = getDb();
@@ -43,9 +44,20 @@ async function getUnreadCount(userId) {
 
 async function getNotifications(userId, limit = 20, offset = 0) {
     const db = getDb();
-    return (await db.prepare(
+    const notifications = await db.prepare(
         `SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
-    ).all(userId, limit, offset));
+    ).all(userId, limit, offset);
+    return notifications.map(notification => {
+        if (notification.title !== 'Bagong Coordinator Registration') return notification;
+        const applicant = /^Si (.+) ay nag-apply bilang Coordinator at naghihintay ng approval mula sa HR\.?$/.exec(notification.message?.trim())?.[1];
+        return {
+            ...notification,
+            title: 'New Coordinator Registration',
+            message: applicant
+                ? `${applicant} applied for a coordinator account. HR approval is pending.`
+                : 'A coordinator application is awaiting HR approval.'
+        };
+    });
 }
 
 async function markAsRead(notificationId, userId) {
@@ -65,6 +77,7 @@ async function getMenuGlow(user) {
         '/btw': 0,
         '/concerns': 0,
         '/manpower': 0,
+        '/incidents': 0,
         '/admin/pending-coordinators': 0,
         '/coordinator-attendance': 0,
         '/attendance': 0,
@@ -89,8 +102,10 @@ async function getMenuGlow(user) {
             }
         }
 
-        // 2. Role-specific actionable pending counts for HR and ADMIN
-        if (user.role === 'HR' || user.role === 'ADMIN') {
+        if (user.role === 'ADMIN') return { ...glow, ...await getPendingCounts(db) };
+
+        // Role-specific pending counts for HR and Head HR
+        if (user.role === 'HR' || user.role === 'HEAD_HR') {
             const pendingBtw = (await db.prepare(
                 "SELECT COUNT(*) as c FROM btw_cases WHERE status IN ('pending_hr_review', 'for_clarification')"
             ).get());
@@ -98,11 +113,20 @@ async function getMenuGlow(user) {
                 glow['/btw'] = Math.max(glow['/btw'], Number(pendingBtw.c));
             }
 
-            const pendingCoordinators = (await db.prepare(
-                "SELECT COUNT(*) as c FROM users WHERE role = 'COORDINATOR' AND status = 'pending'"
-            ).get());
-            if (pendingCoordinators && pendingCoordinators.c > 0) {
-                glow['/admin/pending-coordinators'] = Math.max(glow['/admin/pending-coordinators'], Number(pendingCoordinators.c));
+            if (user.role === 'HR') {
+                const pendingCoordinators = (await db.prepare(
+                    "SELECT COUNT(*) as c FROM users WHERE role = 'COORDINATOR' AND status = 'pending'"
+                ).get());
+                if (pendingCoordinators && pendingCoordinators.c > 0) {
+                    glow['/admin/pending-coordinators'] = Math.max(glow['/admin/pending-coordinators'], Number(pendingCoordinators.c));
+                }
+            } else if (user.role === 'HEAD_HR') {
+                const pendingHr = (await db.prepare(
+                    "SELECT COUNT(*) as c FROM users WHERE role = 'HR' AND status = 'pending'"
+                ).get());
+                if (pendingHr && pendingHr.c > 0) {
+                    glow['/admin/pending-coordinators'] = Math.max(glow['/admin/pending-coordinators'], Number(pendingHr.c));
+                }
             }
 
             const openConcerns = (await db.prepare(
@@ -113,10 +137,17 @@ async function getMenuGlow(user) {
             }
 
             const pendingManpower = (await db.prepare(
-                "SELECT COUNT(*) as c FROM manpower_requests WHERE status = 'pending'"
+                "SELECT COUNT(*) as c FROM manpower_requests WHERE status = 'pending' OR status = 'submitted'"
             ).get());
             if (pendingManpower && pendingManpower.c > 0) {
                 glow['/manpower'] = Math.max(glow['/manpower'], Number(pendingManpower.c));
+            }
+
+            const activeIncidents = (await db.prepare(
+                "SELECT COUNT(*) as c FROM incident_reports WHERE status IN ('reported', 'under_investigation')"
+            ).get());
+            if (activeIncidents && activeIncidents.c > 0) {
+                glow['/incidents'] = Math.max(glow['/incidents'], Number(activeIncidents.c));
             }
         } else if (user.role === 'COORDINATOR') {
             const coordinatorAreaId = user.area_id;

@@ -2,216 +2,195 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const { getDb } = require('../db/database');
-const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email');
+const { getDb, runTransaction } = require('../db/database');
+const { sendPasswordResetEmail } = require('../services/email');
 const { loginLimiter } = require('../middleware/rate-limit');
 const { logAction } = require('../services/audit');
-const { notifyHR } = require('../services/notification');
+const { notifyRole } = require('../services/notification');
 const { isExpired } = require('../services/time');
-
-// GET /login
-router.get('/login', (req, res) => {
+router.get('/login', async (req, res) => {
     if (req.session.user) {
         if (req.session.user.status === 'pending') {
             return res.redirect('/pending');
         }
         return res.redirect('/dashboard');
     }
+    const db = getDb();
+    let areas = [];
+    try {
+        areas = (await db.prepare('SELECT id, name FROM areas WHERE is_active = 1 ORDER BY name ASC').all()) || [];
+    } catch (e) {}
+
     const suspended = req.query.suspended === '1';
     res.render('auth/login', {
         title: 'Login - TAASCOR',
         suspended,
-        isRegister: false
+        isRegister: false,
+        areas
     });
 });
 
 // POST /login
 router.post('/login', loginLimiter, async (req, res) => {
     const { email, password } = req.body;
+    const username = typeof email === 'string' ? email.trim() : '';
     const db = getDb();
-
-    if (!email || !password) {
-        req.flash('error', 'Please provide both username/email and password.');
-        return res.redirect('/login');
-    }
-
-    const trimmedInput = (email || '').trim();
-    const candidateEmail = trimmedInput.includes('@') ? trimmedInput : `${trimmedInput}@taascor.com`;
-    
-    // Case-insensitive lookup by email, candidate email, or full name
-    const user = (await db.prepare(`
-        SELECT * FROM users 
-        WHERE LOWER(TRIM(email)) = LOWER(?) 
-           OR LOWER(TRIM(email)) = LOWER(?)
-           OR LOWER(TRIM(full_name)) = LOWER(?)
-        LIMIT 1
-    `).get(trimmedInput, candidateEmail, trimmedInput));
-
-    if (!user) {
-        console.warn(`[AUTH] Login failed: User not found for input "${trimmedInput}"`);
-        req.flash('error', 'Invalid email or password.');
-        return res.redirect('/login');
-    }
-
-    // Flexible password check: bcrypt compare OR fallback common passwords for convenience
-    let validPassword = false;
-    try {
-        if (user.password_hash) {
-            validPassword = bcrypt.compareSync(password, user.password_hash);
-        }
-    } catch (e) {
-        console.error('[AUTH] bcrypt compare error:', e);
-    }
-
-    if (!validPassword) {
-        const lowerInput = (password || '').trim().toLowerCase();
-        if (
-            (user.role === 'COORDINATOR' && ['taascor@2026', 'taascor2026', 'taascor', 'coordinator@2026', 'coordinator', 'phixc', '12345678', 'coordinator123!'].includes(lowerInput)) ||
-            (user.role === 'ADMIN' && ['admin@2026', 'admin', '12345678', 'admin123!'].includes(lowerInput)) ||
-            (user.role === 'HEAD_HR' && ['headhr@2026', 'headhr', '12345678', 'headhr123!'].includes(lowerInput)) ||
-            (user.role === 'HR' && ['hr', 'hr@2026', '12345678', 'hr123!'].includes(lowerInput))
-        ) {
-            validPassword = true;
-            // Rehash and update password in DB to the standard hash
-            try {
-                const newHash = bcrypt.hashSync(password, 12);
-                await db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, user.id);
-            } catch (err) {
-                console.error('[AUTH] Failed to update password hash:', err);
-            }
+    let user;
+    if (username && typeof password === 'string' && password) {
+        user = await db.prepare('SELECT * FROM users WHERE email = ?').get(username);
+        if (!user && !username.includes('@')) {
+            user = await db.prepare('SELECT * FROM users WHERE email = ?').get(`${username}@taascor.com`);
         }
     }
-
-    if (!validPassword) {
-        console.warn(`[AUTH] Login failed: Invalid password for user ${user.email}`);
-        req.flash('error', 'Invalid email or password.');
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+        req.flash('error', 'Incorrect username or password.');
         return res.redirect('/login');
     }
 
+    await new Promise((resolve, reject) => req.session.regenerate(error => error ? reject(error) : resolve()));
     // Check account status
     if (user.status === 'suspended') {
-        req.flash('error', 'Your account has been suspended. Please contact HR or the Administrator.');
+        req.flash('error', 'Account suspended. Contact HR or an administrator.');
         return res.redirect('/login');
     }
 
     if (user.status === 'rejected') {
-        req.flash('error', `Your registration was rejected. Reason: ${user.rejection_remarks || 'Not specified'}`);
+        req.flash('error', `Registration rejected: ${user.rejection_remarks || 'Not specified'}`);
         return res.redirect('/login');
     }
 
-    // Auto-verify email if not yet verified
-    if (!user.email_verified) {
-        await db.prepare('UPDATE users SET email_verified = 1 WHERE id = ?').run(user.id);
-        user.email_verified = 1;
+    // Account pending approval - redirect to /pending
+    if (user.status === 'pending') {
+        let approverRole = 'HR';
+        if (user.role === 'HR') approverRole = 'Head HR';
+        if (user.role === 'HEAD_HR') approverRole = 'Administrator';
+
+        req.session.user = {
+            id: user.id,
+            email: user.email,
+            full_name: user.full_name,
+            role: user.role,
+            status: 'pending'
+        };
+        req.flash('warning', `Your account is awaiting approval from ${approverRole}.`);
+        return res.redirect('/pending');
     }
 
-    // Update last login
-    (await db.prepare("UPDATE users SET last_login_at = UTC_TIMESTAMP() WHERE id = ?").run(user.id));
+    await db.prepare('UPDATE users SET last_login_at = UTC_TIMESTAMP() WHERE id = ?').run(user.id);
 
-    // Rotate the session ID after authentication; persist it in MySQL.
-    await new Promise((resolve, reject) => req.session.regenerate(error => error ? reject(error) : resolve()));
     // Set user session
     req.session.user = {
         id: user.id,
         email: user.email,
         full_name: user.full_name,
         role: user.role,
-        status: user.status,
+        status: 'active',
         must_change_password: user.must_change_password
     };
 
     (await logAction(user.id, 'LOGIN', 'users', user.id, { email: user.email }, req.ip));
 
-    if (user.status === 'pending') {
-        return res.redirect('/pending');
-    }
-
-    if (user.must_change_password) {
-        req.flash('warning', 'Please set a new password before proceeding.');
-        return res.redirect('/change-password');
-    }
-
     req.flash('success', `Welcome back, ${user.full_name}!`);
-    res.redirect('/dashboard');
+    res.redirect(user.must_change_password ? '/change-password' : '/dashboard');
 });
 
 // GET /register
-router.get('/register', (req, res) => {
+router.get('/register', async (req, res) => {
     if (req.session.user) return res.redirect('/dashboard');
-    res.render('auth/login', { title: 'Register - TAASCOR', isRegister: true });
+    const db = getDb();
+    let areas = [];
+    try {
+        areas = (await db.prepare('SELECT id, name FROM areas WHERE is_active = 1 ORDER BY name ASC').all()) || [];
+    } catch (e) {}
+
+    res.render('auth/login', {
+        title: 'Register - TAASCOR',
+        isRegister: true,
+        areas
+    });
 });
 
 // POST /register
 router.post('/register', async (req, res) => {
-    const { full_name, email, password, confirm_password } = req.body;
+    const { full_name, email, password, confirm_password, role, area_id } = req.body;
     const db = getDb();
 
     if (!full_name || !email || !password || !confirm_password) {
-        req.flash('error', 'All fields are required.');
+        req.flash('error', 'All required fields must be filled.');
         return res.redirect('/register');
     }
 
-    const trimmedEmail = email.trim().toLowerCase();
-
-    // Enforce @taascor.com
-    if (!trimmedEmail.endsWith('@taascor.com')) {
-        req.flash('error', 'Registration is strictly for company emails ending with @taascor.com.');
-        return res.redirect('/register');
-    }
+    const trimmedInput = email.trim().toLowerCase();
+    const candidateEmail = trimmedInput.includes('@') ? trimmedInput : `${trimmedInput}@taascor.com`;
 
     if (password !== confirm_password) {
         req.flash('error', 'Passwords do not match.');
         return res.redirect('/register');
     }
 
-    if (password.length < 8) {
-        req.flash('error', 'Password must be at least 8 characters long.');
+    if (password.length < 6) {
+        req.flash('error', 'Password must be at least 6 characters long.');
         return res.redirect('/register');
     }
 
-    // Check existing
-    const existing = (await db.prepare('SELECT id FROM users WHERE email = ?').get(trimmedEmail));
+    // Check existing by email or candidate email
+    const existing = (await db.prepare('SELECT id FROM users WHERE email = ? OR email = ?').get(trimmedInput, candidateEmail));
     if (existing) {
-        req.flash('error', 'An account with this email address already exists.');
-        return res.redirect('/register');
+        req.flash('error', 'An account with this email address already exists. Please log in.');
+        return res.redirect('/login');
     }
+
+    const allowedRoles = ['COORDINATOR', 'HR', 'HEAD_HR'];
+    const chosenRole = allowedRoles.includes(role) ? role : 'COORDINATOR';
 
     const hash = bcrypt.hashSync(password, 12);
 
-    // All public registrations are strictly COORDINATOR with pending status
-    const result = (await db.prepare(`
-        INSERT INTO users (email, password_hash, full_name, role, status, email_verified, created_at, updated_at)
-        VALUES (?, ?, ?, 'COORDINATOR', 'pending', 0, UTC_TIMESTAMP(), UTC_TIMESTAMP())
-    `).run(trimmedEmail, hash, full_name.trim()));
+    let targetAreaId = null;
+    if (chosenRole === 'COORDINATOR' && area_id) {
+        const area = await db.prepare('SELECT id FROM areas WHERE id = ? AND is_active = 1').get(Number(area_id) || null);
+        if (!area) {
+            req.flash('error', 'Please select an active warehouse.');
+            return res.redirect('/register');
+        }
+        targetAreaId = area.id;
+    }
 
-    const userId = result.lastInsertRowid;
+    try {
+        await runTransaction(async () => {
+            const result = await db.prepare(`
+                INSERT INTO users (email, password_hash, full_name, role, status, email_verified, must_change_password, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'pending', 1, 0, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+            `).run(candidateEmail, hash, full_name.trim(), chosenRole);
+            const userId = result.lastInsertRowid;
+            if (targetAreaId) {
+                await db.prepare(`
+                    INSERT INTO coordinator_area_assignments (user_id, area_id, assigned_by, assigned_at, is_current, remarks)
+                    VALUES (?, ?, ?, UTC_TIMESTAMP(), 1, 'Requested upon registration')
+                `).run(userId, targetAreaId, userId);
+            }
+            await logAction(userId, 'REGISTER', 'users', userId, { email: candidateEmail, role: chosenRole, area_id: targetAreaId }, req.ip);
+        });
+    } catch (error) {
+        if (error.code !== 'ER_DUP_ENTRY') throw error;
+        req.flash('error', 'An account with this email address already exists. Please log in.');
+        return res.redirect('/login');
+    }
 
-    // Generate email verification token
-    const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    // Role-specific notifications and messages
+    if (chosenRole === 'COORDINATOR') {
+        await notifyRole('HR', 'New Coordinator Registration', `${full_name.trim()} applied for a coordinator account. HR approval is pending.`, '/admin/pending-coordinators');
+        await notifyRole('ADMIN', 'New Coordinator Registration', `${full_name.trim()} applied for a coordinator account. HR approval is pending.`, '/admin/pending-coordinators');
+        req.flash('success', 'Registration submitted. Awaiting HR approval.');
+    } else if (chosenRole === 'HR') {
+        await notifyRole('HEAD_HR', 'New HR Staff Registration', `${full_name.trim()} applied for an HR staff account. Head HR approval is pending.`, '/admin/pending-coordinators');
+        await notifyRole('ADMIN', 'New HR Staff Registration', `${full_name.trim()} applied for an HR staff account. Head HR approval is pending.`, '/admin/pending-coordinators');
+        req.flash('success', 'Registration submitted. Awaiting Head HR approval.');
+    } else if (chosenRole === 'HEAD_HR') {
+        await notifyRole('ADMIN', 'New Head HR Registration', `${full_name.trim()} applied for a Head HR account. Administrator approval is pending.`, '/admin/pending-coordinators');
+        req.flash('success', 'Registration submitted. Awaiting administrator approval.');
+    }
 
-    (await db.prepare(`
-        INSERT INTO email_verification_tokens (user_id, token, expires_at)
-        VALUES (?, ?, ?)
-    `).run(userId, token, expiresAt));
-
-    await sendVerificationEmail(trimmedEmail, token);
-
-    (await logAction(userId, 'REGISTER', 'users', userId, { email: trimmedEmail, role: 'COORDINATOR' }, req.ip));
-
-    // Notify HR
-    (await notifyHR(
-        'New Coordinator Registration',
-        `${full_name.trim()} (${trimmedEmail}) has registered and requires approval and area assignment.`,
-        '/admin/pending-coordinators',
-        `reg-${userId}`
-    ));
-
-    res.render('auth/verify-email', {
-        title: 'Verify Your Email - TAASCOR',
-        email: trimmedEmail,
-        token: process.env.NODE_ENV !== 'production' ? token : null
-    });
+    res.redirect('/login');
 });
 
 // GET /verify-email
@@ -254,6 +233,11 @@ router.get('/pending', async (req, res) => {
     const db = getDb();
     const user = (await db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.user.id));
     
+    if (!user) {
+        req.session.destroy();
+        return res.redirect('/login');
+    }
+
     if (user.status === 'active') {
         req.session.user.status = 'active';
         return res.redirect('/dashboard');
@@ -267,33 +251,27 @@ router.get('/pending', async (req, res) => {
 
 // GET /forgot-password
 router.get('/forgot-password', (req, res) => {
-    res.render('auth/forgot-password', { title: 'Forgot Password - TAASCOR' });
+    res.render('auth/forgot-password', { 
+        title: 'Forgot Password - TAASCOR',
+        csrfToken: req.csrfToken ? req.csrfToken() : ''
+    });
 });
 
 // POST /forgot-password
 router.post('/forgot-password', async (req, res) => {
-    const { email } = req.body;
-    if (!email) {
-        req.flash('error', 'Please enter your email.');
-        return res.redirect('/forgot-password');
-    }
-
+    const username = typeof req.body.email === 'string' ? req.body.email.trim() : '';
     const db = getDb();
-    const user = (await db.prepare('SELECT * FROM users WHERE email = ?').get(email.trim()));
+    const email = username.includes('@') ? username : `${username}@taascor.com`;
+    const user = await db.prepare("SELECT id, email FROM users WHERE email = ? AND status = 'active' AND email_verified = 1").get(email);
 
-    if (user) {
+    if (user && (process.env.NODE_ENV !== 'production' || process.env.SMTP_HOST)) {
         const token = crypto.randomBytes(32).toString('hex');
         const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-
-        (await db.prepare(`
-            INSERT INTO password_reset_tokens (user_id, token, expires_at)
-            VALUES (?, ?, ?)
-        `).run(user.id, token, expiresAt));
-
+        await db.prepare('INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES (?, ?, ?)').run(user.id, token, expiresAt);
         await sendPasswordResetEmail(user.email, token);
     }
 
-    req.flash('success', 'If an account exists with that email, a password reset link has been sent.');
+    req.flash('success', 'If the account is eligible, a password reset link will be sent by email.');
     res.redirect('/login');
 });
 
@@ -313,35 +291,41 @@ router.get('/reset-password', async (req, res) => {
         return res.redirect('/login');
     }
 
-    res.render('auth/reset-password', { title: 'Reset Password - TAASCOR', token });
+    res.render('auth/reset-password', { 
+        title: 'Reset Password - TAASCOR', 
+        token,
+        csrfToken: req.csrfToken ? req.csrfToken() : ''
+    });
 });
 
 // POST /reset-password
 router.post('/reset-password', async (req, res) => {
     const { token, password, confirm_password } = req.body;
-    if (!password || password !== confirm_password) {
+    if (typeof password !== 'string' || password !== confirm_password) {
         req.flash('error', 'Passwords do not match.');
-        return res.redirect(`/reset-password?token=${token}`);
+        return res.redirect(`/reset-password?token=${encodeURIComponent(token || '')}`);
     }
 
     if (password.length < 8) {
         req.flash('error', 'Password must be at least 8 characters long.');
-        return res.redirect(`/reset-password?token=${token}`);
+        return res.redirect(`/reset-password?token=${encodeURIComponent(token || '')}`);
     }
 
     const db = getDb();
-    const row = (await db.prepare('SELECT * FROM password_reset_tokens WHERE token = ? AND used_at IS NULL').get(token));
-
-    if (!row || isExpired(row.expires_at)) {
+    const changed = await runTransaction(async () => {
+        const row = await db.prepare('SELECT * FROM password_reset_tokens WHERE token = ? AND used_at IS NULL FOR UPDATE').get(token);
+        if (!row || isExpired(row.expires_at)) return false;
+        const hash = await bcrypt.hash(password, 12);
+        const result = await db.prepare("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = UTC_TIMESTAMP() WHERE id = ? AND status = 'active' AND email_verified = 1").run(hash, row.user_id);
+        await db.prepare('UPDATE password_reset_tokens SET used_at = UTC_TIMESTAMP() WHERE id = ?').run(row.id);
+        return result.changes > 0;
+    });
+    if (!changed) {
         req.flash('error', 'Reset link expired or invalid.');
         return res.redirect('/login');
     }
 
-    const hash = bcrypt.hashSync(password, 12);
-    (await db.prepare("UPDATE users SET password_hash = ?, updated_at = UTC_TIMESTAMP() WHERE id = ?").run(hash, row.user_id));
-    (await db.prepare("UPDATE password_reset_tokens SET used_at = UTC_TIMESTAMP() WHERE id = ?").run(row.id));
-
-    req.flash('success', 'Password reset successfully. You can now log in.');
+    req.flash('success', 'Password reset successfully. You can now log in with your new password.');
     res.redirect('/login');
 });
 
@@ -369,7 +353,7 @@ router.post('/change-password', async (req, res) => {
     const db = getDb();
     const user = (await db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.user.id));
 
-    if (!bcrypt.compareSync(current_password, user.password_hash)) {
+    if (!user || user.status !== 'active' || typeof current_password !== 'string' || !(await bcrypt.compare(current_password, user.password_hash))) {
         req.flash('error', 'Current password is incorrect.');
         return res.redirect('/change-password');
     }

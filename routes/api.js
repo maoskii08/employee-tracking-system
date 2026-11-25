@@ -4,6 +4,7 @@ const { getDb } = require('../db/database');
 const { getUnreadCount, getNotifications, getMenuGlow } = require('../services/notification');
 const { validateAreaAccess } = require('../middleware/area-guard');
 const { handleEmployeeAbsence } = require('../services/btw');
+const { coordinatorRosterCondition } = require('../services/attendance-roster');
 const { logAction } = require('../services/audit');
 const { DateTime } = require('luxon');
 
@@ -25,6 +26,7 @@ router.get('/notifications/latest', async (req, res) => {
 // GET /api/schedules/check-conflict
 router.get('/schedules/check-conflict', async (req, res) => {
     if (!req.session.user) return res.status(401).json({ error: 'Unauthorized' });
+    if (req.session.user.role === 'ADMIN') return res.status(403).json({ error: 'Access denied' });
     const { employee_id, work_date } = req.query;
     if (!employee_id || !work_date) return res.json({ conflict: false });
 
@@ -223,6 +225,7 @@ router.post('/attendance/save', async (req, res) => {
     if (!req.session.user) return res.status(401).json({ success: false, error: 'Unauthorized' });
     const user = req.session.user;
     const db = getDb();
+    if (user.role === 'ADMIN') return res.status(403).json({ success: false, error: 'Access denied' });
     const { work_date, attendance } = req.body;
 
     if (!work_date || !attendance || typeof attendance !== 'object') {
@@ -247,13 +250,18 @@ router.post('/attendance/save', async (req, res) => {
             version = version + 1
     `);
 
+    const findEmployee = db.prepare(`
+        SELECT e.area_id FROM employees e
+        WHERE e.id = ? ${user.role === 'COORDINATOR' ? `AND ${coordinatorRosterCondition}` : ''}
+    `);
+
     for (const [empIdStr, data] of Object.entries(attendance)) {
         const empId = parseInt(empIdStr);
         if (!empId) continue;
         const status = (typeof data === 'string' ? data : (data.status || '')).toLowerCase();
         if (!validStatuses.includes(status)) continue;
 
-        const emp = (await db.prepare('SELECT area_id FROM employees WHERE id = ?').get(empId));
+        const emp = await findEmployee.get(empId);
         if (!emp || !validateAreaAccess(emp.area_id, req)) continue;
 
         const scheduleId = (typeof data === 'object' && data.schedule_id) ? parseInt(data.schedule_id) : null;

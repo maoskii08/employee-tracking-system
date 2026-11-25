@@ -2,6 +2,7 @@ require('dotenv').config();
 require('express-async-errors');
 const express = require('express');
 const path = require('path');
+const { spawn } = require('child_process');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
 const { initializeDb, getDb, closeDb } = require('./db/database');
@@ -14,6 +15,7 @@ const { getMenuGlow } = require('./services/notification');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1');
 
 const sessionSecret = process.env.SESSION_SECRET;
 if (!sessionSecret || sessionSecret.length < 32 || sessionSecret.startsWith('change-this')) {
@@ -64,6 +66,7 @@ app.use(async (req, res, next) => {
             const db = getDb();
             const freshUser = (await db.prepare('SELECT id, email, full_name, role, status, profile_photo, phone, bio FROM users WHERE id = ?').get(req.session.user.id));
             if (freshUser) {
+                req.session.user.role = freshUser.role;
                 req.session.user.full_name = freshUser.full_name;
                 req.session.user.profile_photo = freshUser.profile_photo;
                 req.session.user.phone = freshUser.phone;
@@ -175,20 +178,25 @@ app.use(attachArea);
 // CSRF Protection
 app.use(csrfProtection);
 
+const { requireRole } = require('./middleware/auth');
+const requireOperationsAccess = requireRole('HR', 'HEAD_HR', 'COORDINATOR');
+
 // Mount Routes
 app.use('/', require('./routes/auth'));
 app.use('/dashboard', require('./routes/dashboard'));
 app.use('/employees', require('./routes/employees'));
-app.use('/schedules', require('./routes/schedules'));
-app.use('/attendance', require('./routes/attendance'));
-app.use('/coordinator-attendance', require('./routes/coordinator-attendance'));
+app.use('/masterlist', require('./routes/masterlist'));
+app.use('/schedules', requireOperationsAccess, require('./routes/schedules'));
+app.use('/attendance', requireOperationsAccess, require('./routes/attendance'));
+app.use('/coordinator-attendance', requireOperationsAccess, require('./routes/coordinator-attendance'));
 app.use('/concerns', require('./routes/concerns'));
 app.use('/btw', require('./routes/btw'));
 app.use('/manpower', require('./routes/manpower'));
+app.use('/incidents', require('./routes/incidents'));
 app.use('/notifications', require('./routes/notifications'));
 app.use('/admin', require('./routes/admin'));
 app.use('/departments', require('./routes/departments'));
-app.use('/reports', require('./routes/reports'));
+app.use('/reports', requireOperationsAccess, require('./routes/reports'));
 app.use('/api', require('./routes/api'));
 
 // 404 handler
@@ -202,12 +210,17 @@ app.use((req, res) => {
 
 // Error handler
 app.use((err, req, res, next) => {
-    console.error(err);
+    console.error('[SERVER ERROR]', err);
 
     if (err.code === 'EBADCSRFTOKEN') {
         req.flash('error', 'Form session expired or invalid CSRF token. Please try again.');
-        const fallback = req.get('Referrer') || '/';
+        const fallback = req.get('Referrer') || '/login';
         return res.redirect(fallback);
+    }
+
+    if (req.path === '/login' || req.path === '/register' || (req.get('Referrer') && req.get('Referrer').includes('/login'))) {
+        req.flash('error', 'Incorrect username or password.');
+        return res.redirect('/login');
     }
 
     res.status(500).render('error', {
@@ -223,34 +236,18 @@ async function start(port = PORT) {
     await initializeDb();
     await createInitialAdmin();
     
-    // Ensure HR account exists
-    const db = getDb();
-    const hrAccount = await db.prepare("SELECT id FROM users WHERE email = 'hr'").get();
-    if (!hrAccount) {
-        const bcrypt = require('bcryptjs');
-        const hrHash = bcrypt.hashSync('hr', 12);
-        await db.prepare(
-            `INSERT INTO users (email, password_hash, full_name, role, status, email_verified, created_at, updated_at)
-             VALUES ('hr', ?, 'HR Staff', 'HR', 'active', 1, UTC_TIMESTAMP(), UTC_TIMESTAMP())`
-        ).run(hrHash);
-    }
-
-    // Ensure all coordinators and warehouses from roster are synchronized
-    const coordCount = await db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'COORDINATOR'").get();
-    if (!coordCount || coordCount.count < 50) {
-        try {
-            const { seedCoordinatorsAndWarehouses } = require('./scripts/seed-coordinators-warehouses');
-            await seedCoordinatorsAndWarehouses();
-        } catch (e) {
-            console.error('Coordinators sync error on start:', e.message);
-        }
-    }
-
     await sessionStore.onReady();
-    return app.listen(port, () => {
-        console.log(`TAASCOR Attendance Tracking System (ATS) running on http://localhost:${PORT}`);
-        console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    const server = app.listen(Number(port), HOST);
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.once('listening', () => {
+            server.removeListener('error', reject);
+            resolve();
+        });
     });
+    console.log(`TAASCOR Attendance Tracking System (ATS) running on http://localhost:${server.address().port}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    return server;
 }
 
 async function shutdown() {
@@ -258,12 +255,25 @@ async function shutdown() {
     await closeDb();
 }
 if (require.main === module) {
+    const openLocal = process.platform === 'win32' && process.argv.includes('--open-local');
     start().then(server => {
+        if (openLocal) {
+            const url = `http://localhost:${server.address().port}/login`;
+            const browser = spawn('rundll32.exe', ['url.dll,FileProtocolHandler', url], { stdio: 'ignore', windowsHide: true });
+            browser.on('error', () => console.log(`Open ${url} in your browser.`));
+            browser.unref();
+        }
         for (const signal of ['SIGINT', 'SIGTERM']) {
             process.once(signal, () => server.close(() => shutdown().then(() => process.exit(0))));
         }
     }).catch(async error => {
         console.error('Startup failed:', error.message);
+        if (openLocal && ['ECONNREFUSED', 'ETIMEDOUT'].includes(error.code)) {
+            console.error('Start MySQL in the XAMPP Control Panel, then run START_TAASCOR_SERVER.bat again.');
+        }
+        if (openLocal && error.code === 'EADDRINUSE') {
+            console.error(`Port ${PORT} is already in use. If TAASCOR is already running, open http://localhost:${PORT}/login.`);
+        }
         await shutdown();
         process.exitCode = 1;
     });

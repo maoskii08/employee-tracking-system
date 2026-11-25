@@ -8,11 +8,20 @@
             <span>/</span>
             <span><%= request.area_name %></span>
             <span>•</span>
-            <span>Deployment: <%= formatDate(request.deployment_date) %></span>
+            <span>Term Deployment: <%= formatDate(request.deployment_date) %></span>
         </div>
     </div>
-    <div>
+    <div style="display: flex; align-items: center; gap: 10px;">
         <%- include('../partials/status-badge', { status: request.status }) %>
+        <% if (canEdit) { %>
+            <a href="/manpower/<%= request.id %>/edit" class="btn btn-sm btn-outline">Edit Request</a>
+        <% } %>
+        <% if (!['filled'].includes(request.status) && (user.role === 'HR' || user.role === 'ADMIN' || user.role === 'HEAD_HR' || (user.role === 'COORDINATOR' && request.requested_by === user.id))) { %>
+        <form method="POST" action="/manpower/<%= request.id %>/delete" onsubmit="return confirm('Delete this manpower request? This cannot be undone.')" style="display:inline;">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+            <button type="submit" class="btn btn-sm" style="background: var(--color-danger); color: #fff; border: none;">🗑 Delete Request</button>
+        </form>
+        <% } %>
     </div>
 </div>
 
@@ -59,7 +68,7 @@
         <div class="detail-value"><%= request.requester_name || 'Coordinator' %></div>
     </div>
     <div class="detail-item">
-        <div class="detail-label">Required Deployment Date</div>
+        <div class="detail-label">Required Term Deployment Date</div>
         <div class="detail-value"><strong><%= formatDate(request.deployment_date) %></strong></div>
     </div>
     <div class="detail-item">
@@ -77,9 +86,12 @@
 </div>
 
 <!-- Requested Position Breakdown -->
-<div class="card mb-3">
+<div class="card mb-3" id="requested-positions">
     <div class="card-header">
-        <h3>📋 Requested Position Breakdown</h3>
+        <h3>Requested Positions</h3>
+        <% if (canEdit) { %>
+            <a href="/manpower/<%= request.id %>/edit?section=positions" class="btn btn-sm btn-outline">Edit Positions</a>
+        <% } %>
     </div>
     <div class="card-body" style="padding: 0;">
         <table class="data-table">
@@ -114,6 +126,7 @@
                         <th>Worker Candidate</th>
                         <th>Requested Position</th>
                         <th>Actual Position</th>
+                        <th>Department</th>
                         <th>Status</th>
                         <th>Allocated By</th>
                         <th class="text-right">Coordinator Action</th>
@@ -122,7 +135,7 @@
                 <tbody>
                     <% if (allocations.length === 0) { %>
                         <tr>
-                            <td colspan="6" class="text-center" style="padding: 24px;">
+                            <td colspan="7" class="text-center" style="padding: 24px;">
                                 No workers allocated by HR yet.
                             </td>
                         </tr>
@@ -144,23 +157,26 @@
                                         </div>
                                     <% } %>
                                 </td>
+                                <td><%= a.status === 'confirmed' && a.employee_area_id === request.area_id ? (a.department_name || '—') : '—' %></td>
                                 <td>
                                     <% if (a.status === 'confirmed') { %>
-                                        <span class="badge badge-success">✓ Confirmed On Duty</span>
+                                        <span class="badge badge-success">Reported to Office</span>
                                     <% } else if (a.status === 'did_not_report') { %>
                                         <span class="badge badge-danger">✕ Did Not Report</span>
                                     <% } else { %>
-                                        <span class="badge badge-warning">⏳ Awaiting Arrival</span>
+                                        <span class="badge badge-warning">Awaiting Office Report</span>
                                     <% } %>
                                 </td>
                                 <td><%= a.allocated_by_name %></td>
                                 <td class="text-right">
-                                    <% if (a.status === 'proposed') { %>
+                                    <% if (canManageWarehouse && a.status !== 'confirmed' && !['cancelled', 'declined'].includes(request.status)) { %>
                                         <div class="btn-group" style="justify-content: flex-end;">
                                             <button type="button" class="btn btn-sm btn-success" 
-                                                    onclick="openArrivalModal('<%= a.id %>', '<%= a.worker_name || a.existing_emp_name %>', '<%= a.request_position_id %>')">
-                                                Confirm Arrival
+                                                    data-allocation-id="<%= a.id %>" data-worker-name="<%= a.worker_name || a.existing_emp_name %>" data-position-id="<%= a.actual_position_id || a.requested_position_id %>"
+                                                    onclick="openArrivalModal(this)">
+                                                Confirm Office Report
                                             </button>
+                                            <% if (a.status === 'proposed') { %>
                                             <form action="/manpower/<%= request.id %>/confirm-arrival" method="POST" style="display: inline;">
                                                 <input type="hidden" name="_csrf" value="<%= csrfToken %>">
                                                 <input type="hidden" name="allocation_id" value="<%= a.id %>">
@@ -170,7 +186,10 @@
                                                     No Show
                                                 </button>
                                             </form>
+                                            <% } %>
                                         </div>
+                                    <% } else if (canManageWarehouse && a.status === 'confirmed' && a.employee_area_id === request.area_id && user.role === 'COORDINATOR') { %>
+                                        <a href="/employees/<%= a.employee_id %>/edit" class="btn btn-sm btn-outline">Edit Employee</a>
                                     <% } else { %>
                                         <span class="text-muted text-xs">Processed</span>
                                     <% } %>
@@ -188,7 +207,7 @@
 <div id="arrivalModal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; align-items: center; justify-content: center;">
     <div class="card" style="max-width: 550px; width: 90%; margin: auto; background: white;">
         <div class="card-header">
-            <h3>Confirm Worker Arrival & Deployment</h3>
+            <h3>Confirm Office Report</h3>
             <button type="button" class="alert-close" onclick="document.getElementById('arrivalModal').style.display='none'">×</button>
         </div>
         <div class="card-body">
@@ -198,15 +217,27 @@
                 <input type="hidden" name="status_decision" value="confirmed">
 
                 <p style="font-size: 0.88rem; color: var(--color-gray-600); margin-bottom: 16px;">
-                    Confirming arrival for: <strong id="modalWorkerName"></strong><br>
-                    This will activate the worker in your warehouse's <strong>Active Masterfile</strong> and update manpower fulfillment counts.
+                    Confirm that <strong id="modalWorkerName"></strong> reported to the office. Their assignment will appear in Attendance and the Employee Masterlist.
                 </p>
+
+                <div class="form-group">
+                    <label for="department_id">Department <span class="required">*</span></label>
+                    <select id="department_id" name="department_id" class="form-control" required>
+                        <option value="">Select a department</option>
+                        <% departments.forEach(department => { %>
+                            <option value="<%= department.id %>"><%= department.name %></option>
+                        <% }) %>
+                    </select>
+                    <% if (!departments.length) { %>
+                        <p class="form-help">Add a department in <a href="/departments">Departments</a> before confirming.</p>
+                    <% } %>
+                </div>
 
                 <div class="form-group">
                     <label for="actual_position_id">Actual Assigned Position <span class="required">*</span></label>
                     <select id="actual_position_id" name="actual_position_id" class="form-control" required onchange="checkPositionChange(this)">
                         <% positionsList.forEach(p => { %>
-                            <option value="<%= p.id %>"><%= p.title %></option>
+                            <option value="<%= p.id %>" data-archived="<%= !p.is_active %>"><%= p.title %></option>
                         <% }) %>
                     </select>
                 </div>
@@ -228,7 +259,7 @@
                 </div>
 
                 <div class="btn-group" style="margin-top: 20px;">
-                    <button type="submit" class="btn btn-success btn-lg">Confirm Arrival & Deploy</button>
+                    <button type="submit" class="btn btn-success btn-lg">Confirm Report</button>
                     <button type="button" class="btn btn-outline" onclick="document.getElementById('arrivalModal').style.display='none'">Cancel</button>
                 </div>
             </form>
@@ -237,82 +268,91 @@
 </div>
 
 <script>
-function openArrivalModal(allocId, name, reqPosId) {
-    document.getElementById('modalAllocId').value = allocId;
-    document.getElementById('modalWorkerName').textContent = name;
+function openArrivalModal(button) {
+    const form = document.querySelector('#arrivalModal form');
+    form.reset();
+    document.getElementById('modalAllocId').value = button.dataset.allocationId;
+    document.getElementById('modalWorkerName').textContent = button.dataset.workerName;
+    const position = document.getElementById('actual_position_id');
+    position.dataset.requestedPosition = button.dataset.positionId;
+    for (const option of position.options) {
+        option.disabled = option.dataset.archived === 'true' && option.value !== button.dataset.positionId;
+    }
+    position.value = button.dataset.positionId;
+    checkPositionChange(position);
     document.getElementById('arrivalModal').style.display = 'flex';
 }
 
 function checkPositionChange(select) {
-    // If selected position differs, show reason box
-    document.getElementById('posReasonGroup').style.display = 'block';
+    document.getElementById('posReasonGroup').style.display =
+        select.value && select.value !== select.dataset.requestedPosition ? 'block' : 'none';
 }
 </script>
 
-<!-- HR Action: Assign Workers (HR / ADMIN only) -->
-<% if (user.role === 'HR' || user.role === 'ADMIN') { %>
-    <div class="card mb-3" style="border: 2px solid var(--color-primary);">
-        <div class="card-header" style="background: rgba(27,42,74,0.05);">
-            <h3>🤝 HR Worker Allocation</h3>
-            <span class="text-sm text-muted">Assign candidates or register incoming workers for deployment</span>
-        </div>
+<% if (['HR', 'ADMIN'].includes(user.role) && !['filled', 'cancelled', 'declined'].includes(request.status)) { %>
+    <%
+        const openPositions = requestedPositions.map(position => ({
+            ...position,
+            remaining: Number(position.quantity_requested) - allocations.filter(allocation =>
+                allocation.request_position_id === position.id && ['proposed', 'confirmed'].includes(allocation.status)).length
+        })).filter(position => position.remaining > 0);
+    %>
+    <div class="card mb-3">
+        <div class="card-header"><h3>Send Workers to the Coordinator</h3></div>
         <div class="card-body">
-            <form action="/manpower/<%= request.id %>/allocate" method="POST">
-                <input type="hidden" name="_csrf" value="<%= csrfToken %>">
-
-                <div class="form-group">
-                    <label for="request_position_id">For Requested Position Slot <span class="required">*</span></label>
-                    <select id="request_position_id" name="request_position_id" class="form-control" required>
-                        <% requestedPositions.forEach(p => { %>
-                            <option value="<%= p.id %>"><%= p.position_title %> (Needs <%= p.quantity_requested %>)</option>
-                        <% }) %>
-                    </select>
-                </div>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Worker Sourcing Method</label>
-                        <div style="display: flex; gap: 16px; margin-top: 8px;">
-                            <label class="form-check" style="cursor: pointer;">
-                                <input type="radio" name="worker_type" value="new" checked onclick="toggleWorkerSource('new')">
-                                <span>Incoming / External Candidate</span>
-                            </label>
-                            <label class="form-check" style="cursor: pointer;">
-                                <input type="radio" name="worker_type" value="existing" onclick="toggleWorkerSource('existing')">
-                                <span>Existing Employee Transfer</span>
-                            </label>
-                        </div>
+            <% if (!openPositions.length) { %>
+                <p>All requested slots have been assigned. Awaiting arrival confirmation.</p>
+            <% } else { %>
+                <form action="/manpower/<%= request.id %>/allocate" method="POST" id="worker-batch">
+                    <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+                    <div class="worker-batch-toolbar">
+                        <p id="worker-batch-count" class="text-muted" style="margin: 0;" aria-live="polite"></p>
+                        <button type="button" class="btn btn-outline" id="add-worker">Add Worker</button>
                     </div>
-                </div>
-
-                <div class="form-group" id="incomingWorkerGroup">
-                    <label for="worker_name">Candidate Full Name <span class="required">*</span></label>
-                    <input type="text" id="worker_name" name="worker_name" class="form-control" placeholder="e.g. Rolando Bautista">
-                </div>
-
-                <div class="form-group" id="existingEmployeeGroup" style="display: none;">
-                    <label for="existing_employee_id">Select Existing Employee</label>
-                    <select id="existing_employee_id" name="existing_employee_id" class="form-control">
-                        <option value="">— Select Employee —</option>
-                        <% availableEmployees.forEach(emp => { %>
-                            <option value="<%= emp.id %>"><%= emp.full_name %> (<%= emp.employee_id %>)</option>
-                        <% }) %>
-                    </select>
-                </div>
-
-                <button type="submit" class="btn btn-primary">
-                    Assign Candidate to Request
-                </button>
-            </form>
+                    <div id="worker-batch-rows">
+                        <fieldset class="worker-batch-entry" data-worker-row>
+                            <legend>Worker 1</legend>
+                            <div class="worker-batch-fields">
+                                <label class="form-group">Requested Position
+                                    <select name="workers[0][request_position_id]" data-field="request_position_id" class="form-control" required>
+                                        <% openPositions.forEach(position => { %>
+                                            <option value="<%= position.id %>" data-remaining="<%= position.remaining %>"><%= position.position_title %> (<%= position.remaining %> open)</option>
+                                        <% }); %>
+                                    </select>
+                                </label>
+                                <label class="form-group">Worker Source
+                                    <select name="workers[0][worker_type]" data-field="worker_type" class="form-control">
+                                        <option value="new">Incoming / External Candidate</option>
+                                        <option value="existing">Existing Employee Transfer</option>
+                                    </select>
+                                </label>
+                                <div class="worker-batch-candidate">
+                                    <label class="form-group" data-worker-source="new">Candidate Full Name
+                                        <input type="text" name="workers[0][worker_name]" data-field="worker_name" class="form-control" maxlength="191" placeholder="e.g. Rolando Bautista" required>
+                                    </label>
+                                    <label class="form-group" data-worker-source="existing" hidden>Select Existing Employee
+                                        <select name="workers[0][existing_employee_id]" data-field="existing_employee_id" class="form-control" disabled>
+                                            <option value="">Select employee</option>
+                                            <% availableEmployees.forEach(employee => { %>
+                                                <option value="<%= employee.id %>"><%= employee.full_name %> (<%= employee.employee_id %>)</option>
+                                            <% }); %>
+                                        </select>
+                                    </label>
+                                </div>
+                                <button type="button" class="btn btn-outline worker-batch-remove" data-remove-worker aria-label="Remove Worker 1" title="Remove worker">
+                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                                        <path d="M3 6h18M9 6V4h6v2m4 0-1 14H6L5 6m5 4v6m4-6v6"/>
+                                    </svg>
+                                </button>
+                            </div>
+                        </fieldset>
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="send-workers">Send Workers</button>
+                </form>
+                <script src="/js/manpower-worker-batch.js"></script>
+            <% } %>
         </div>
     </div>
-
-    <script>
-    function toggleWorkerSource(type) {
-        document.getElementById('incomingWorkerGroup').style.display = type === 'new' ? 'block' : 'none';
-        document.getElementById('existingEmployeeGroup').style.display = type === 'existing' ? 'block' : 'none';
-    }
-    </script>
 <% } %>
 
 <!-- Communication Thread -->
@@ -339,6 +379,7 @@ function checkPositionChange(select) {
             <% }) %>
         </div>
 
+        <% if (canManageWarehouse) { %>
         <div style="border-top: 2px solid var(--color-gray-200); padding-top: 20px; margin-top: 20px;">
             <form action="/manpower/<%= request.id %>/reply" method="POST">
                 <input type="hidden" name="_csrf" value="<%= csrfToken %>">
@@ -348,6 +389,7 @@ function checkPositionChange(select) {
                 <button type="submit" class="btn btn-outline">Post Message</button>
             </form>
         </div>
+        <% } %>
     </div>
 </div>
 

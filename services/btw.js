@@ -1,4 +1,4 @@
-const { getDb } = require('../db/database');
+const { getDb, runTransaction } = require('../db/database');
 const { createNotification, notifyHR } = require('./notification');
 const { logAction } = require('./audit');
 const { randomUUID } = require('crypto');
@@ -8,21 +8,13 @@ const { randomUUID } = require('crypto');
  * Idempotent: checks for existing open cases or dedup_key.
  */
 async function handleEmployeeAbsence(employeeId, workDate, recordedByUserId, remarks = '') {
-    return getDb().transaction(() => recordAbsence(employeeId, workDate, recordedByUserId, remarks))();
+    return runTransaction(() => recordAbsence(employeeId, workDate, recordedByUserId, remarks));
 }
 
 async function recordAbsence(employeeId, workDate, recordedByUserId, remarks) {
     const db = getDb();
-    // Serialize concurrent absence submissions for this employee.
-    await db.prepare('SELECT id FROM employees WHERE id = ? FOR UPDATE').get(employeeId);
-    
-    // Get employee details
-    const emp = (await db.prepare(`
-        SELECT e.*, a.name as area_name 
-        FROM employees e 
-        JOIN areas a ON e.area_id = a.id 
-        WHERE e.id = ?
-    `).get(employeeId));
+    // Serialize absence updates for the same employee before reading their open cases.
+    const emp = await db.prepare('SELECT * FROM employees WHERE id = ? FOR UPDATE').get(employeeId);
 
     if (!emp) return null;
 

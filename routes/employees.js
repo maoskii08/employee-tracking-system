@@ -259,8 +259,8 @@ router.get('/:id', requireAuth, async (req, res) => {
         return res.status(403).render('error', { title: 'Access Denied', message: 'You can only access employees within your assigned area.', code: 403 });
     }
 
-    // Historical attendance summary
-    const attendanceStats = (await db.prepare(`
+    const showAttendance = req.session.user.role !== 'ADMIN';
+    const attendanceStats = showAttendance ? await db.prepare(`
         SELECT 
             COUNT(*) as total_records,
             SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) as present_count,
@@ -272,17 +272,17 @@ router.get('/:id', requireAuth, async (req, res) => {
             SUM(CASE WHEN status = 'rest_day' THEN 1 ELSE 0 END) as restday_count
         FROM employee_attendance
         WHERE employee_id = ?
-    `).get(id));
+    `).get(id) : null;
 
     // Recent attendance
-    const recentAttendance = (await db.prepare(`
+    const recentAttendance = showAttendance ? await db.prepare(`
         SELECT ea.*, u.full_name as recorded_by_name
         FROM employee_attendance ea
         LEFT JOIN users u ON ea.recorded_by = u.id
         WHERE ea.employee_id = ?
         ORDER BY ea.work_date DESC
         LIMIT 10
-    `).all(id));
+    `).all(id) : [];
 
     // BTW cases
     const btwCases = (await db.prepare(`
@@ -300,6 +300,7 @@ router.get('/:id', requireAuth, async (req, res) => {
     res.render('employees/view', {
         title: `${employee.full_name} - Employee Details`,
         employee,
+        showAttendance,
         attendanceStats,
         recentAttendance,
         btwCases,
@@ -367,6 +368,11 @@ router.post('/:id/edit', requireAuth, async (req, res) => {
         return res.redirect(`/employees/${id}/edit`);
     }
     const targetAreaId = user.role === 'COORDINATOR' ? req.userAreaId : (area_id ? parseInt(area_id) : employee.area_id);
+    const departmentId = department_id ? Number(department_id) : null;
+    if (department_id && !await db.prepare('SELECT id FROM departments WHERE id = ? AND area_id = ?').get(departmentId || 0, targetAreaId)) {
+        req.flash('error', 'Select a department in the employee’s warehouse.');
+        return res.redirect(`/employees/${id}/edit`);
+    }
     const positionName = String(position_title || '').trim();
     let resolvedPositionId = position_id ? Number.parseInt(position_id, 10) : null;
     if (positionName) {
@@ -390,7 +396,7 @@ router.post('/:id/edit', requireAuth, async (req, res) => {
         lastName,
         fullName,
         resolvedPositionId,
-        department_id ? parseInt(department_id) : null,
+        departmentId,
         targetAreaId,
         startDate,
         remarks ? remarks.trim() : null,
@@ -398,7 +404,7 @@ router.post('/:id/edit', requireAuth, async (req, res) => {
         id
     ));
 
-    (await logAction(user.id, 'UPDATE_EMPLOYEE', 'employees', id, { full_name: fullName, department_id: department_id ? parseInt(department_id) : null }));
+    (await logAction(user.id, 'UPDATE_EMPLOYEE', 'employees', id, { full_name: fullName, department_id: departmentId }));
 
     req.flash('success', 'Employee updated successfully.');
     res.redirect(`/employees/${id}`);
@@ -422,9 +428,13 @@ router.post('/:id/assign-department', requireAuth, async (req, res) => {
     }
 
     let deptName = 'Unassigned';
-    if (departmentId) {
-        const dept = (await db.prepare('SELECT * FROM departments WHERE id = ?').get(departmentId));
-        if (dept) deptName = dept.name;
+    if (req.body.department_id) {
+        const dept = await db.prepare('SELECT name FROM departments WHERE id = ? AND area_id = ?').get(departmentId || 0, employee.area_id);
+        if (!dept) {
+            req.flash('error', 'Select a department in the employee’s warehouse.');
+            return res.redirect(`/employees/${id}`);
+        }
+        deptName = dept.name;
     }
 
     (await db.prepare("UPDATE employees SET department_id = ?, updated_at = UTC_TIMESTAMP(), updated_by = ? WHERE id = ?")
